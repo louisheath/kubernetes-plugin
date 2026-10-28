@@ -32,7 +32,7 @@ public class KubernetesClientProvider {
      *
      * Some providers such as Amazon EKS use a token with 15 minutes expiration, so expire clients after 10 minutes.
      */
-    private static final long CACHE_EXPIRATION = Long.getLong(
+    static final long CACHE_EXPIRATION = Long.getLong(
             KubernetesClientProvider.class.getPackage().getName() + ".clients.cacheExpiration",
             TimeUnit.MINUTES.toSeconds(10));
 

@@ -46,6 +46,7 @@ import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import java.util.HashMap;
 import java.util.Map;
+import org.jenkinsci.plugins.kubernetes.auth.KubernetesAuthConfig;
 import org.jenkinsci.plugins.kubernetes.auth.KubernetesAuthException;
 import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl;
 import org.junit.After;
@@ -199,6 +200,35 @@ public class KubernetesFactoryAdapterTest {
         assertFalse(client.getConfiguration().getAutoConfigure());
         assertEquals(KUBERNETES_MASTER_URL, client.getConfiguration().getMasterUrl());
         assertEquals("sa-token", client.getConfiguration().getOauthToken());
+        assertEquals(
+                "sa-token", client.getConfiguration().getOauthTokenProvider().getToken());
+    }
+
+    @Test
+    public void tokenCredentialIsReResolved() throws Exception {
+        String id = "rotating-token";
+        StringCredentialsImpl initial =
+                new StringCredentialsImpl(CredentialsScope.GLOBAL, id, "", Secret.fromString("token-1"));
+        SystemCredentialsProvider.getInstance().getCredentials().add(initial);
+        try (KubernetesClient client =
+                new KubernetesFactoryAdapter(KUBERNETES_MASTER_URL, null, null, id, false).createClient()) {
+            assertEquals("token-1", client.getConfiguration().getOauthToken());
+            assertEquals(
+                    "token-1", client.getConfiguration().getOauthTokenProvider().getToken());
+        }
+
+        KubernetesFactoryAdapter.CredentialsTokenProvider provider =
+                new KubernetesFactoryAdapter.CredentialsTokenProvider(
+                        id, j.jenkins, new KubernetesAuthConfig(KUBERNETES_MASTER_URL, null, false), "token-1", 0);
+        SystemCredentialsProvider.getInstance().getCredentials().remove(initial);
+        SystemCredentialsProvider.getInstance()
+                .getCredentials()
+                .add(new StringCredentialsImpl(CredentialsScope.GLOBAL, id, "", Secret.fromString("token-2")));
+        assertEquals("token-2", provider.getToken());
+
+        // a failed lookup keeps the last token
+        SystemCredentialsProvider.getInstance().getCredentials().clear();
+        assertEquals("token-2", provider.getToken());
     }
 
     @Test

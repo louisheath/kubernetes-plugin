@@ -2,6 +2,7 @@ package org.csanchez.jenkins.plugins.kubernetes;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.logging.Level.FINE;
+import static java.util.logging.Level.WARNING;
 
 import com.cloudbees.plugins.credentials.CredentialsMatchers;
 import com.cloudbees.plugins.credentials.CredentialsProvider;
@@ -17,10 +18,13 @@ import io.fabric8.kubernetes.client.Config;
 import io.fabric8.kubernetes.client.ConfigBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import io.fabric8.kubernetes.client.OAuthTokenProvider;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import jenkins.authentication.tokens.api.AuthenticationTokens;
 import jenkins.model.Jenkins;
@@ -53,6 +57,9 @@ public class KubernetesFactoryAdapter {
 
     @CheckForNull
     private final KubernetesAuth auth;
+
+    private final String credentialsId;
+    private final ItemGroup context;
 
     private final boolean skipTlsVerify;
     private final int connectTimeout;
@@ -147,6 +154,8 @@ public class KubernetesFactoryAdapter {
         this.namespace = namespace;
         this.caCertData = decodeBase64IfNeeded(caCertData);
         this.auth = AuthenticationTokens.convert(KubernetesAuth.class, resolveCredentials(credentialsId, context));
+        this.credentialsId = credentialsId;
+        this.context = context;
         this.skipTlsVerify = skipTlsVerify;
         this.connectTimeout = connectTimeout;
         this.readTimeout = readTimeout;
@@ -181,10 +190,16 @@ public class KubernetesFactoryAdapter {
         }
 
         if (auth != null) {
-            builder =
-                    auth.decorate(builder, new KubernetesAuthConfig(builder.getMasterUrl(), caCertData, skipTlsVerify));
-            // If authentication is provided, disable autoconfigure flag to deactivate auto refresh
+            KubernetesAuthConfig authConfig =
+                    new KubernetesAuthConfig(builder.getMasterUrl(), caCertData, skipTlsVerify);
+            builder = auth.decorate(builder, authConfig);
+            // keep autoconfigure off so fabric8 does not replace the credential with the environment's own
             builder = builder.withAutoConfigure(false);
+            if (builder.getOauthToken() != null) {
+                // re-resolve the credential so long-lived clients (e.g. the pod reaper's watch) survive token rotation
+                builder = builder.withOauthTokenProvider(
+                        new CredentialsTokenProvider(credentialsId, context, authConfig, builder.getOauthToken()));
+            }
         }
 
         if (skipTlsVerify) {
@@ -271,6 +286,68 @@ public class KubernetesFactoryAdapter {
         return "KubernetesFactoryAdapter [serviceAddress=" + serviceAddress + ", namespace=" + namespace
                 + ", caCertData=" + caCertData + ", credentials=" + auth + ", skipTlsVerify=" + skipTlsVerify
                 + ", connectTimeout=" + connectTimeout + ", readTimeout=" + readTimeout + "]";
+    }
+
+    /** The bearer token the credentials currently yield, or null if they do not authenticate with one. */
+    @CheckForNull
+    private static String resolveToken(String credentialsId, ItemGroup context, KubernetesAuthConfig authConfig)
+            throws KubernetesAuthException {
+        KubernetesAuth auth =
+                AuthenticationTokens.convert(KubernetesAuth.class, resolveCredentials(credentialsId, context));
+        return auth == null
+                ? null
+                : auth.decorate(new ConfigBuilder(Config.empty()), authConfig).getOauthToken();
+    }
+
+    /**
+     * Re-resolves a token credential so that long-lived clients keep authenticating after the token rotates. The
+     * Kubernetes client consults it before every request and again after a 401. {@code Config.getOauthToken()} keeps
+     * the initial token; the provider takes precedence.
+     */
+    static final class CredentialsTokenProvider implements OAuthTokenProvider {
+        private final String credentialsId;
+        private final ItemGroup context;
+        private final KubernetesAuthConfig authConfig;
+        private final long cacheNanos;
+        private final AtomicLong nextRefresh;
+        private volatile String token;
+
+        CredentialsTokenProvider(
+                String credentialsId, ItemGroup context, KubernetesAuthConfig authConfig, String token) {
+            this(credentialsId, context, authConfig, token, KubernetesClientProvider.CACHE_EXPIRATION);
+        }
+
+        CredentialsTokenProvider(
+                String credentialsId,
+                ItemGroup context,
+                KubernetesAuthConfig authConfig,
+                String token,
+                long cacheSeconds) {
+            this.credentialsId = credentialsId;
+            this.context = context;
+            this.authConfig = authConfig;
+            this.token = token;
+            this.cacheNanos = TimeUnit.SECONDS.toNanos(cacheSeconds);
+            this.nextRefresh = new AtomicLong(System.nanoTime() + cacheNanos);
+        }
+
+        @Override
+        public String getToken() {
+            long due = nextRefresh.get();
+            long now = System.nanoTime();
+            // only one caller refreshes; the others carry on with the current token
+            if (now - due >= 0 && nextRefresh.compareAndSet(due, now + cacheNanos)) {
+                try {
+                    String fresh = resolveToken(credentialsId, context, authConfig);
+                    if (fresh != null) {
+                        token = fresh;
+                    }
+                } catch (KubernetesAuthException | RuntimeException e) {
+                    LOGGER.log(WARNING, e, () -> "Could not refresh the token of credentials " + credentialsId);
+                }
+            }
+            return token;
+        }
     }
 
     @CheckForNull
